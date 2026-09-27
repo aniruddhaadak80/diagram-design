@@ -126,6 +126,25 @@ def run_gate(checkout: Checkout) -> tuple[int, str]:
     return code, stream.getvalue()
 
 
+def committed_manifest_check(manifest: dict, source_for) -> tuple[bool, str]:
+    """Compare committed digests the way the gate does.
+
+    Sources are hashed as canonical text and PNGs as raw bytes. A raw digest
+    of a source would tie the check to the checkout's line endings.
+    """
+
+    sources: list[str] = []
+    pngs: list[str] = []
+    for entry in manifest["entries"]:
+        slug = entry["slug"]
+        if entry["source_sha256"] != screenshot_catalog.sha256_text(source_for(slug)):
+            sources.append(slug)
+        screenshot = screenshot_catalog.screenshot_path(slug)
+        if entry["screenshot_sha256"] != screenshot_catalog.sha256(screenshot):
+            pngs.append(slug)
+    return not sources and not pngs, f"source_mismatch={sources} png_mismatch={pngs}"
+
+
 def main() -> int:
     slugs = screenshot_catalog.canonical_slugs()
     failures: list[str] = []
@@ -159,18 +178,24 @@ def main() -> int:
         code, out = run_gate(checkout)
         record("a CRLF checkout of unchanged sources passes", code == 0, out.strip())
 
-        # Canonicalizing must not hide a real edit.
+        # Canonicalizing must not hide a real edit: one CRLF source differs from
+        # its committed text by a single character, and the manifest keeps the
+        # digest of the unedited LF text.
         checkout = Checkout(root / "drift", slugs)
         checkout.write_sources("\r\n")
+        edited = checkout.source(slugs[0])
+        edited.write_bytes(edited.read_bytes().replace(b'lang="en"', b'lang="em"', 1))
         checkout.write_screenshots(SCREENSHOT)
         checkout.write_manifest(
-            lambda slug: digest(source_bytes(slug) + b"<!-- edited -->\n"),
+            lambda slug: digest(source_bytes(slug)),
             lambda slug: digest(SCREENSHOT),
         )
         code, out = run_gate(checkout)
         record(
             "an edited source still fails on a CRLF checkout",
-            code == 1 and "source changed" in out,
+            code == 1
+            and f"{slugs[0]}: source changed" in out
+            and out.count("source changed") == 1,
             out.strip(),
         )
 
@@ -217,26 +242,36 @@ def main() -> int:
             folded,
         )
 
-    # The committed manifest already holds canonical digests, so normalizing
-    # text sources changes no recorded value and needs no regeneration.
-    manifest = json.loads(screenshot_catalog.MANIFEST.read_text(encoding="utf-8"))
-    canonical: list[str] = []
-    raw: list[str] = []
-    for entry in manifest["entries"]:
-        slug = entry["slug"]
-        source = screenshot_catalog.source_path(slug)
-        screenshot = screenshot_catalog.screenshot_path(slug)
-        if entry["source_sha256"] != screenshot_catalog.sha256_text(source):
-            canonical.append(slug)
-        if entry["source_sha256"] != screenshot_catalog.sha256(source):
-            raw.append(f"{slug} source")
-        if entry["screenshot_sha256"] != screenshot_catalog.sha256(screenshot):
-            raw.append(f"{slug} png")
-    record(
-        "committed manifest digests survive canonicalization",
-        not canonical and not raw,
-        f"canonical_mismatch={canonical} raw_mismatch={raw}",
-    )
+        # The committed manifest already holds canonical digests, so normalizing
+        # text sources changes no recorded value and needs no regeneration.
+        manifest = json.loads(screenshot_catalog.MANIFEST.read_text(encoding="utf-8"))
+        record(
+            "committed manifest digests match this checkout",
+            *committed_manifest_check(manifest, screenshot_catalog.source_path),
+        )
+
+        # The same check against CRLF copies of the committed sources, so this
+        # test stays green on a core.autocrlf=true checkout even though CI
+        # always checks out LF.
+        crlf_dir = root / "committed-crlf"
+        crlf_dir.mkdir()
+        unconverted: list[str] = []
+        for entry in manifest["entries"]:
+            slug = entry["slug"]
+            lf = screenshot_catalog.source_path(slug).read_bytes().replace(b"\r\n", b"\n")
+            copy = crlf_dir / f"example-{slug}.html"
+            copy.write_bytes(lf.replace(b"\n", b"\r\n"))
+            if screenshot_catalog.sha256(copy) == entry["source_sha256"]:
+                unconverted.append(slug)
+        record(
+            "CRLF copies of the committed sources differ from the committed bytes",
+            not unconverted,
+            f"unchanged_by_crlf={unconverted}",
+        )
+        record(
+            "committed manifest digests match CRLF copies of the sources",
+            *committed_manifest_check(manifest, lambda slug: crlf_dir / f"example-{slug}.html"),
+        )
 
     if failures:
         print("FAIL screenshot freshness regression tests")
